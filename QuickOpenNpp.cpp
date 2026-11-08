@@ -1,4 +1,4 @@
-// QuickOpenNpp v0.2 — native Win32 open-document fuzzy switcher for Notepad++.
+// QuickOpenNpp v0.3 — native Win32 open-document fuzzy switcher for Notepad++.
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -11,10 +11,13 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
+#include <commdlg.h>
+#include <uxtheme.h>
 #include <string>
 #include <vector>
 #include <algorithm>
 #include <cwctype>
+#include <cwchar>
 #include <unordered_set>
 #include <climits>
 
@@ -29,6 +32,10 @@ static constexpr UINT NPPM_ACTIVATEDOC = NPPMSG + 28;
 static constexpr UINT NPPM_GETPLUGINSCONFIGDIR = NPPMSG + 46;
 static constexpr UINT NPPM_GETFULLPATHFROMBUFFERID = NPPMSG + 58;
 static constexpr UINT NPPM_GETBUFFERIDFROMPOS = NPPMSG + 59;
+static constexpr UINT NPPM_GETEDITORDEFAULTFOREGROUNDCOLOR = NPPMSG + 90;
+static constexpr UINT NPPM_GETEDITORDEFAULTBACKGROUNDCOLOR = NPPMSG + 91;
+static constexpr UINT NPPM_ISDARKMODEENABLED = NPPMSG + 107;
+static constexpr UINT NPPM_GETDARKMODECOLORS = NPPMSG + 108;
 static constexpr int PRIMARY_VIEW = 1; // GETNBOPENFILES only
 static constexpr int SECOND_VIEW = 2;  // GETNBOPENFILES only
 static constexpr int EDIT_ID = 101;
@@ -55,6 +62,58 @@ static int g_width = DEFAULT_WIDTH, g_height = DEFAULT_HEIGHT;
 static int g_x = CW_USEDEFAULT, g_y = CW_USEDEFAULT;
 static int g_nameWidth = 230, g_folderWidth = 440;
 static bool g_closing = false;
+static const wchar_t SETTINGS_CLASS[] = L"QuickOpenNppSettingsClassV3";
+static HWND g_settings = nullptr;
+enum ThemeMode { FOLLOW_EDITOR = 0, FOLLOW_UI = 1, CUSTOM = 2 };
+struct ThemeColors { COLORREF bg, fg, selection, selectionText; };
+struct NppDarkColors {
+    COLORREF background, softerBackground, hotBackground, pureBackground, errorBackground;
+    COLORREF text, darkerText, disabledText, linkText, edge, hotEdge, disabledEdge;
+};
+static int g_themeMode = FOLLOW_EDITOR;
+static ThemeColors g_custom{RGB(18,30,38), RGB(229,237,243), RGB(39,87,118), RGB(255,255,255)};
+static ThemeColors g_theme = g_custom;
+static HBRUSH g_backgroundBrush = nullptr;
+static ThemeColors g_draft = g_custom;
+static int g_draftMode = FOLLOW_EDITOR;
+static HFONT g_settingsFont = nullptr;
+static COLORREF g_chooseColors[16]{};
+static constexpr int MODE_EDITOR = 201, MODE_UI = 202, MODE_CUSTOM = 203;
+static constexpr int COLOR_BG = 211, COLOR_FG = 212, COLOR_SEL = 213, COLOR_SEL_TEXT = 214;
+static constexpr int BTN_SAVE = 220, BTN_CANCEL = 221;
+
+static COLORREF blend(COLORREF a, COLORREF b, int bPercent) {
+    const int aPercent = 100 - bPercent;
+    return RGB((GetRValue(a)*aPercent + GetRValue(b)*bPercent)/100,
+               (GetGValue(a)*aPercent + GetGValue(b)*bPercent)/100,
+               (GetBValue(a)*aPercent + GetBValue(b)*bPercent)/100);
+}
+static bool darkColor(COLORREF c) {
+    return (GetRValue(c)*299 + GetGValue(c)*587 + GetBValue(c)*114) < 128000;
+}
+static void refreshTheme() {
+    ThemeColors colors = g_custom;
+    if (g_themeMode == FOLLOW_EDITOR && g_npp._nppHandle) {
+        colors.bg = static_cast<COLORREF>(SendMessageW(g_npp._nppHandle, NPPM_GETEDITORDEFAULTBACKGROUNDCOLOR, 0, 0));
+        colors.fg = static_cast<COLORREF>(SendMessageW(g_npp._nppHandle, NPPM_GETEDITORDEFAULTFOREGROUNDCOLOR, 0, 0));
+        colors.selection = blend(colors.bg, darkColor(colors.bg) ? RGB(86,148,192) : RGB(61,126,190), darkColor(colors.bg) ? 45 : 25);
+        colors.selectionText = colors.fg;
+    } else if (g_themeMode == FOLLOW_UI && g_npp._nppHandle) {
+        bool dark = SendMessageW(g_npp._nppHandle, NPPM_ISDARKMODEENABLED, 0, 0) != 0;
+        if (dark) {
+            NppDarkColors npp{};
+            if (SendMessageW(g_npp._nppHandle, NPPM_GETDARKMODECOLORS, sizeof(npp), reinterpret_cast<LPARAM>(&npp))) {
+                colors = {npp.pureBackground, npp.text, npp.hotBackground, npp.text};
+            } else colors = {RGB(32,32,32), RGB(235,235,235), RGB(65,87,105), RGB(255,255,255)};
+        } else {
+            colors = {GetSysColor(COLOR_WINDOW), GetSysColor(COLOR_WINDOWTEXT), GetSysColor(COLOR_HIGHLIGHT), GetSysColor(COLOR_HIGHLIGHTTEXT)};
+        }
+    }
+    g_theme = colors;
+    if (g_backgroundBrush) DeleteObject(g_backgroundBrush);
+    g_backgroundBrush = CreateSolidBrush(g_theme.bg);
+}
+
 
 static std::wstring lowercase(std::wstring value) {
     for (auto& ch : value) ch = static_cast<wchar_t>(towlower(ch));
@@ -100,8 +159,31 @@ static void writeInt(const wchar_t* name, int value) {
     const std::wstring str = std::to_wstring(value);
     WritePrivateProfileStringW(L"Window", name, str.c_str(), g_iniPath.c_str());
 }
+static void loadAppearance() {
+    if (g_iniPath.empty()) return;
+    g_themeMode = static_cast<int>(GetPrivateProfileIntW(L"Appearance", L"Mode", FOLLOW_EDITOR, g_iniPath.c_str()));
+    if (g_themeMode < FOLLOW_EDITOR || g_themeMode > CUSTOM) g_themeMode = FOLLOW_EDITOR;
+    g_custom.bg = static_cast<COLORREF>(GetPrivateProfileIntW(L"Appearance", L"Background", static_cast<int>(RGB(18,30,38)), g_iniPath.c_str()));
+    g_custom.fg = static_cast<COLORREF>(GetPrivateProfileIntW(L"Appearance", L"Text", static_cast<int>(RGB(229,237,243)), g_iniPath.c_str()));
+    g_custom.selection = static_cast<COLORREF>(GetPrivateProfileIntW(L"Appearance", L"Selection", static_cast<int>(RGB(39,87,118)), g_iniPath.c_str()));
+    g_custom.selectionText = static_cast<COLORREF>(GetPrivateProfileIntW(L"Appearance", L"SelectionText", static_cast<int>(RGB(255,255,255)), g_iniPath.c_str()));
+    refreshTheme();
+}
+static void saveAppearance() {
+    if (g_iniPath.empty()) return;
+    auto save = [](const wchar_t* key, int value) {
+        std::wstring str = std::to_wstring(value);
+        WritePrivateProfileStringW(L"Appearance", key, str.c_str(), g_iniPath.c_str());
+    };
+    save(L"Mode", g_themeMode);
+    save(L"Background", static_cast<int>(g_custom.bg));
+    save(L"Text", static_cast<int>(g_custom.fg));
+    save(L"Selection", static_cast<int>(g_custom.selection));
+    save(L"SelectionText", static_cast<int>(g_custom.selectionText));
+}
 static void loadSettings() {
     g_iniPath = configurationFile();
+    loadAppearance();
     g_width = std::max(MIN_WIDTH, readInt(L"Width", DEFAULT_WIDTH));
     g_height = std::max(MIN_HEIGHT, readInt(L"Height", DEFAULT_HEIGHT));
     g_nameWidth = std::max(70, readInt(L"NameWidth", 230));
@@ -267,6 +349,12 @@ static LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                reinterpret_cast<HMENU>(static_cast<INT_PTR>(LIST_ID)), g_instance, nullptr);
         if (!g_edit || !g_list) return -1;
         ListView_SetExtendedListViewStyle(g_list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+        ListView_SetBkColor(g_list, g_theme.bg);
+        ListView_SetTextBkColor(g_list, g_theme.bg);
+        ListView_SetTextColor(g_list, g_theme.fg);
+        SetWindowTheme(g_list, darkColor(g_theme.bg) ? L"DarkMode_Explorer" : L"Explorer", nullptr);
+        HWND header = ListView_GetHeader(g_list);
+        if (header) SetWindowTheme(header, darkColor(g_theme.bg) ? L"DarkMode_ItemsView" : L"Explorer", nullptr);
         LVCOLUMNW column{};
         column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
         column.fmt = LVCFMT_LEFT;
@@ -302,8 +390,32 @@ static LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     case WM_COMMAND:
         if (LOWORD(wp) == EDIT_ID && HIWORD(wp) == EN_CHANGE) updateMatches();
         return 0;
+    case WM_CTLCOLOREDIT:
+        if (reinterpret_cast<HWND>(lp) == g_edit) {
+            HDC dc = reinterpret_cast<HDC>(wp);
+            SetTextColor(dc, g_theme.fg);
+            SetBkColor(dc, g_theme.bg);
+            return reinterpret_cast<LRESULT>(g_backgroundBrush);
+        }
+        break;
+    case WM_ERASEBKGND: {
+        RECT r{}; GetClientRect(hwnd, &r);
+        FillRect(reinterpret_cast<HDC>(wp), &r, g_backgroundBrush);
+        return 1;
+    }
     case WM_NOTIFY:
         if (reinterpret_cast<NMHDR*>(lp)->idFrom == LIST_ID) {
+            auto* note = reinterpret_cast<NMHDR*>(lp);
+            if (note->code == NM_CUSTOMDRAW) {
+                auto* draw = reinterpret_cast<NMLVCUSTOMDRAW*>(lp);
+                if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+                if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
+                    bool selected = (ListView_GetItemState(g_list, static_cast<int>(draw->nmcd.dwItemSpec), LVIS_SELECTED) & LVIS_SELECTED) != 0;
+                    draw->clrText = selected ? g_theme.selectionText : g_theme.fg;
+                    draw->clrTextBk = selected ? g_theme.selection : g_theme.bg;
+                    return CDRF_NEWFONT;
+                }
+            }
             if (reinterpret_cast<NMHDR*>(lp)->code == NM_DBLCLK) { activateSelected(); return 0; }
             if (reinterpret_cast<NMHDR*>(lp)->code == NM_CLICK) { SetFocus(g_edit); return 0; }
         }
@@ -333,6 +445,7 @@ static LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     return DefWindowProcW(hwnd, msg, wp, lp);
 }
 static void __cdecl toggleQuickOpen() {
+    if (g_settings && IsWindow(g_settings)) { SetForegroundWindow(g_settings); return; }
     if (g_popup) { closePopup(true); return; }
     if (!g_npp._nppHandle) return;
     loadSettings();
@@ -351,8 +464,125 @@ static void __cdecl toggleQuickOpen() {
               x, y, g_width, g_height, g_npp._nppHandle, nullptr, g_instance, nullptr);
     if (popup) { ShowWindow(popup, SW_SHOW); SetForegroundWindow(popup); SetFocus(g_edit); }
 }
+
+static HWND addControl(HWND parent, const wchar_t* cls, const wchar_t* title, DWORD style,
+                       int id, int x, int y, int w, int h) {
+    HWND control = CreateWindowExW(0, cls, title, WS_CHILD | WS_VISIBLE | style, x, y, w, h,
+                          parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), g_instance, nullptr);
+    if (control && g_settingsFont) SendMessageW(control, WM_SETFONT, reinterpret_cast<WPARAM>(g_settingsFont), TRUE);
+    return control;
+}
+static void enableColorControls(HWND hwnd) {
+    bool enable = g_draftMode == CUSTOM;
+    for (int id = COLOR_BG; id <= COLOR_SEL_TEXT; ++id) {
+        HWND control = GetDlgItem(hwnd, id);
+        if (control) EnableWindow(control, enable);
+    }
+}
+static std::wstring colorLabel(int id, COLORREF color) {
+    const wchar_t* name = id == COLOR_BG ? L"Background" : id == COLOR_FG ? L"Text" :
+                          id == COLOR_SEL ? L"Selected row" : L"Selected text";
+    wchar_t label[100]{};
+    swprintf_s(label, L"%s   (#%02X%02X%02X)...", name, GetRValue(color), GetGValue(color), GetBValue(color));
+    return label;
+}
+static COLORREF* draftColor(int id) {
+    if (id == COLOR_BG) return &g_draft.bg;
+    if (id == COLOR_FG) return &g_draft.fg;
+    if (id == COLOR_SEL) return &g_draft.selection;
+    if (id == COLOR_SEL_TEXT) return &g_draft.selectionText;
+    return nullptr;
+}
+static LRESULT CALLBACK settingsProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    switch (msg) {
+    case WM_CREATE: {
+        g_settings = hwnd;
+        g_draftMode = g_themeMode;
+        g_draft = g_custom;
+        NONCLIENTMETRICSW metrics{sizeof(metrics)};
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0))
+            g_settingsFont = CreateFontIndirectW(&metrics.lfMessageFont);
+        addControl(hwnd, L"STATIC", L"Choose how QuickOpenNpp should look:", 0, 0, 18, 16, 420, 22);
+        addControl(hwnd, L"BUTTON", L"Follow editor theme (active editor colors)", BS_AUTORADIOBUTTON | WS_GROUP,
+                   MODE_EDITOR, 20, 49, 415, 24);
+        addControl(hwnd, L"BUTTON", L"Follow Notepad++ UI (light / dark mode)", BS_AUTORADIOBUTTON,
+                   MODE_UI, 20, 80, 415, 24);
+        addControl(hwnd, L"BUTTON", L"Custom colors", BS_AUTORADIOBUTTON,
+                   MODE_CUSTOM, 20, 111, 415, 24);
+        CheckRadioButton(hwnd, MODE_EDITOR, MODE_CUSTOM, MODE_EDITOR + g_draftMode);
+        addControl(hwnd, L"STATIC", L"Custom palette:", 0, 0, 20, 151, 400, 22);
+        const int ids[] = {COLOR_BG, COLOR_FG, COLOR_SEL, COLOR_SEL_TEXT};
+        for (int i = 0; i < 4; ++i) {
+            int id = ids[i];
+            const std::wstring label = colorLabel(id, *draftColor(id));
+            addControl(hwnd, L"BUTTON", label.c_str(), BS_PUSHBUTTON, id, 20, 179 + i*37, 410, 29);
+        }
+        addControl(hwnd, L"BUTTON", L"Save", BS_DEFPUSHBUTTON, BTN_SAVE, 250, 344, 85, 30);
+        addControl(hwnd, L"BUTTON", L"Cancel", BS_PUSHBUTTON, BTN_CANCEL, 345, 344, 85, 30);
+        enableColorControls(hwnd);
+        return 0;
+    }
+    case WM_COMMAND: {
+        int id = LOWORD(wp);
+        if (id >= MODE_EDITOR && id <= MODE_CUSTOM && HIWORD(wp) == BN_CLICKED) {
+            g_draftMode = id - MODE_EDITOR;
+            enableColorControls(hwnd);
+            return 0;
+        }
+        if (id >= COLOR_BG && id <= COLOR_SEL_TEXT && HIWORD(wp) == BN_CLICKED && g_draftMode == CUSTOM) {
+            COLORREF* selected = draftColor(id);
+            CHOOSECOLORW chooser{sizeof(chooser)};
+            chooser.hwndOwner = hwnd;
+            chooser.rgbResult = *selected;
+            chooser.lpCustColors = g_chooseColors;
+            chooser.Flags = CC_RGBINIT | CC_FULLOPEN;
+            if (ChooseColorW(&chooser)) {
+                *selected = chooser.rgbResult;
+                std::wstring label = colorLabel(id, *selected);
+                SetWindowTextW(GetDlgItem(hwnd, id), label.c_str());
+            }
+            return 0;
+        }
+        if (id == BTN_SAVE) {
+            g_themeMode = g_draftMode;
+            g_custom = g_draft;
+            saveAppearance();
+            refreshTheme();
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (id == BTN_CANCEL) { DestroyWindow(hwnd); return 0; }
+        break;
+    }
+    case WM_CLOSE: DestroyWindow(hwnd); return 0;
+    case WM_DESTROY:
+        g_settings = nullptr;
+        if (g_settingsFont) { DeleteObject(g_settingsFont); g_settingsFont = nullptr; }
+        if (IsWindow(g_npp._nppHandle)) SetForegroundWindow(g_npp._nppHandle);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+static void __cdecl openConfiguration() {
+    if (g_settings && IsWindow(g_settings)) { SetForegroundWindow(g_settings); return; }
+    if (g_popup) closePopup(true);
+    if (!g_npp._nppHandle) return;
+    g_iniPath = configurationFile();
+    loadAppearance();
+    RECT r{}; GetWindowRect(g_npp._nppHandle, &r);
+    int x = r.left + ((r.right-r.left)-470)/2;
+    int y = r.top + ((r.bottom-r.top)-430)/2;
+    HWND hwnd = CreateWindowExW(WS_EX_TOOLWINDOW, SETTINGS_CLASS, L"QuickOpenNpp Configuration",
+              WS_OVERLAPPED | WS_CAPTION | WS_SYSMENU, x, y, 470, 430,
+              g_npp._nppHandle, nullptr, g_instance, nullptr);
+    if (hwnd) { ShowWindow(hwnd, SW_SHOW); SetForegroundWindow(hwnd); }
+}
+
 static ShortcutKey g_shortcut{true, true, true, 'S'};
-static FuncItem g_commands[] = {{L"Quick Open Documents", toggleQuickOpen, 0, false, &g_shortcut}};
+static FuncItem g_commands[] = {
+    {L"Quick Open Documents", toggleQuickOpen, 0, false, &g_shortcut},
+    {L"Configuration...", openConfiguration, 0, false, nullptr}
+};
 extern "C" __declspec(dllexport) void __cdecl setInfo(NppData data) {
     g_npp = data;
     INITCOMMONCONTROLSEX icc{sizeof(icc), ICC_LISTVIEW_CLASSES};
@@ -363,6 +593,9 @@ extern "C" __declspec(dllexport) void __cdecl setInfo(NppData data) {
     wc.lpszClassName = CLASS_NAME;
     wc.hCursor = LoadCursorW(nullptr, IDC_ARROW);
     wc.hbrBackground = reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1);
+    RegisterClassW(&wc);
+    wc.lpfnWndProc = settingsProc;
+    wc.lpszClassName = SETTINGS_CLASS;
     RegisterClassW(&wc);
 }
 extern "C" __declspec(dllexport) const wchar_t* __cdecl getName() { return L"QuickOpenNpp"; }
