@@ -1,4 +1,4 @@
-// QuickOpenNpp v0.4 — native Win32 open-document fuzzy switcher for Notepad++.
+// QuickOpenNpp v0.4.1 — native Win32 open-document fuzzy switcher for Notepad++.
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -395,7 +395,7 @@ static LRESULT drawHeader(NMCUSTOMDRAW* draw) {
     item.mask = HDI_TEXT;
     item.pszText = name;
     item.cchTextMax = static_cast<int>(_countof(name));
-    if (Header_GetItemW(g_header, column, &item)) {
+    if (SendMessageW(g_header, HDM_GETITEMW, static_cast<WPARAM>(column), reinterpret_cast<LPARAM>(&item))) {
         const int saved = SaveDC(draw->hdc);
         SetTextColor(draw->hdc, g_theme.fg);
         SetBkMode(draw->hdc, TRANSPARENT);
