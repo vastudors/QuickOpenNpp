@@ -1,4 +1,4 @@
-// QuickOpenNpp v0.3 — native Win32 open-document fuzzy switcher for Notepad++.
+// QuickOpenNpp v0.4 — native Win32 open-document fuzzy switcher for Notepad++.
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -47,7 +47,7 @@ static constexpr int MIN_HEIGHT = 220;
 static constexpr int MARGIN = 12;
 static constexpr int SEARCH_HEIGHT = 28;
 static constexpr int LIST_GAP = 10;
-static const wchar_t CLASS_NAME[] = L"QuickOpenNppPopupClassV2";
+static const wchar_t CLASS_NAME[] = L"QuickOpenNppPopupClassV4";
 
 struct Document { UINT_PTR bufferId; std::wstring name; std::wstring folder; };
 static NppData g_npp{};
@@ -74,6 +74,7 @@ static int g_themeMode = FOLLOW_EDITOR;
 static ThemeColors g_custom{RGB(18,30,38), RGB(229,237,243), RGB(39,87,118), RGB(255,255,255)};
 static ThemeColors g_theme = g_custom;
 static HBRUSH g_backgroundBrush = nullptr;
+static HWND g_header = nullptr;
 static ThemeColors g_draft = g_custom;
 static int g_draftMode = FOLLOW_EDITOR;
 static HFONT g_settingsFont = nullptr;
@@ -328,6 +329,133 @@ static LRESULT CALLBACK editProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     if (msg == WM_CHAR && (wp == VK_RETURN || wp == VK_ESCAPE)) return 0;
     return CallWindowProcW(g_oldEditProc, hwnd, msg, wp, lp);
 }
+// Theme-aware header painting, while preserving native column resizing.
+static COLORREF headerBackground() {
+    return blend(g_theme.bg, g_theme.fg, darkColor(g_theme.bg) ? 9 : 5);
+}
+static COLORREF frameColor() {
+    return blend(g_theme.bg, g_theme.fg, darkColor(g_theme.bg) ? 29 : 23);
+}
+static LRESULT CALLBACK headerSubclass(HWND hwnd, UINT message, WPARAM wp, LPARAM lp,
+                                        UINT_PTR subclassId, DWORD_PTR) {
+    if (message == WM_ERASEBKGND) {
+        RECT rect{};
+        GetClientRect(hwnd, &rect);
+        HBRUSH brush = CreateSolidBrush(headerBackground());
+        FillRect(reinterpret_cast<HDC>(wp), &rect, brush);
+        DeleteObject(brush);
+        return 1;
+    }
+    if (message == WM_PAINT) {
+        LRESULT result = DefSubclassProc(hwnd, message, wp, lp);
+        // Header's unoccupied area (after the final column) is otherwise system white.
+        RECT client{};
+        GetClientRect(hwnd, &client);
+        int count = Header_GetItemCount(hwnd);
+        RECT last{};
+        int right = 0;
+        if (count > 0 && Header_GetItemRect(hwnd, count - 1, &last)) right = last.right;
+        if (right < client.right) {
+            HDC dc = GetDC(hwnd);
+            if (dc) {
+                RECT rest{right, client.top, client.right, client.bottom};
+                HBRUSH brush = CreateSolidBrush(headerBackground());
+                FillRect(dc, &rest, brush);
+                DeleteObject(brush);
+                ReleaseDC(hwnd, dc);
+            }
+        }
+        return result;
+    }
+    if (message == WM_NCDESTROY) {
+        RemoveWindowSubclass(hwnd, headerSubclass, subclassId);
+        if (g_header == hwnd) g_header = nullptr;
+    }
+    return DefSubclassProc(hwnd, message, wp, lp);
+}
+static LRESULT drawHeader(NMCUSTOMDRAW* draw) {
+    if (draw->dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+    if (draw->dwDrawStage != CDDS_ITEMPREPAINT) return CDRF_DODEFAULT;
+    const int column = static_cast<int>(draw->dwItemSpec);
+    const COLORREF bg = headerBackground();
+    const COLORREF line = frameColor();
+    HBRUSH backgroundBrush = CreateSolidBrush(bg);
+    FillRect(draw->hdc, &draw->rc, backgroundBrush);
+    DeleteObject(backgroundBrush);
+    HPEN pen = CreatePen(PS_SOLID, 1, line);
+    HGDIOBJ oldPen = SelectObject(draw->hdc, pen);
+    MoveToEx(draw->hdc, draw->rc.right - 1, draw->rc.top, nullptr);
+    LineTo(draw->hdc, draw->rc.right - 1, draw->rc.bottom);
+    MoveToEx(draw->hdc, draw->rc.left, draw->rc.bottom - 1, nullptr);
+    LineTo(draw->hdc, draw->rc.right, draw->rc.bottom - 1);
+    SelectObject(draw->hdc, oldPen);
+    DeleteObject(pen);
+    wchar_t name[128]{};
+    HDITEMW item{};
+    item.mask = HDI_TEXT;
+    item.pszText = name;
+    item.cchTextMax = static_cast<int>(_countof(name));
+    if (Header_GetItemW(g_header, column, &item)) {
+        const int saved = SaveDC(draw->hdc);
+        SetTextColor(draw->hdc, g_theme.fg);
+        SetBkMode(draw->hdc, TRANSPARENT);
+        HFONT font = reinterpret_cast<HFONT>(SendMessageW(g_header, WM_GETFONT, 0, 0));
+        if (font) SelectObject(draw->hdc, font);
+        RECT text = draw->rc;
+        text.left += 7;
+        text.right -= 7;
+        DrawTextW(draw->hdc, name, -1, &text,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        RestoreDC(draw->hdc, saved);
+    }
+    return CDRF_SKIPDEFAULT;
+}
+static LRESULT drawListRow(NMLVCUSTOMDRAW* draw) {
+    if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
+    if (draw->nmcd.dwDrawStage != CDDS_ITEMPREPAINT) return CDRF_DODEFAULT;
+    const int row = static_cast<int>(draw->nmcd.dwItemSpec);
+    if (row < 0 || row >= static_cast<int>(g_results.size())) return CDRF_DODEFAULT;
+    const bool selected = (ListView_GetItemState(g_list, row, LVIS_SELECTED) & LVIS_SELECTED) != 0;
+    HDC dc = draw->nmcd.hdc;
+    RECT itemRect{};
+    if (!ListView_GetItemRect(g_list, row, &itemRect, LVIR_BOUNDS)) return CDRF_DODEFAULT;
+    RECT client{};
+    GetClientRect(g_list, &client);
+    RECT wholeRow{client.left, itemRect.top, client.right, itemRect.bottom};
+    HBRUSH brush = CreateSolidBrush(selected ? g_theme.selection : g_theme.bg);
+    FillRect(dc, &wholeRow, brush);
+    DeleteObject(brush);
+    const Document& doc = g_documents[g_results[row]];
+    const std::wstring* fields[] = { &doc.name, &doc.folder };
+    const int saved = SaveDC(dc);
+    SetBkMode(dc, TRANSPARENT);
+    SetTextColor(dc, selected ? g_theme.selectionText : g_theme.fg);
+    HFONT font = reinterpret_cast<HFONT>(SendMessageW(g_list, WM_GETFONT, 0, 0));
+    if (font) SelectObject(dc, font);
+    for (int col = 0; col < 2; ++col) {
+        RECT cell{};
+        if (!ListView_GetSubItemRect(g_list, row, col, LVIR_BOUNDS, &cell)) continue;
+        // Subitem 0's BOUNDS may include other columns. Obtain its right edge from header.
+        if (col == 0) {
+            RECT headerCell{};
+            if (g_header && Header_GetItemRect(g_header, 0, &headerCell)) {
+                MapWindowPoints(g_header, g_list, reinterpret_cast<POINT*>(&headerCell), 2);
+                cell.left = headerCell.left;
+                cell.right = headerCell.right;
+            }
+        }
+        const int cellDc = SaveDC(dc);
+        IntersectClipRect(dc, cell.left, cell.top, cell.right, cell.bottom);
+        cell.left += 6;
+        cell.right -= 6;
+        DrawTextW(dc, fields[col]->c_str(), -1, &cell,
+                  DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        RestoreDC(dc, cellDc);
+    }
+    RestoreDC(dc, saved);
+    return CDRF_SKIPDEFAULT;
+}
+
 static void layoutChildren(HWND hwnd) {
     RECT rc{}; GetClientRect(hwnd, &rc);
     int width = std::max<int>(1, rc.right - 2 * MARGIN);
@@ -340,10 +468,10 @@ static LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     switch (msg) {
     case WM_CREATE: {
         g_popup = hwnd;
-        g_edit = CreateWindowExW(WS_EX_CLIENTEDGE, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
+        g_edit = CreateWindowExW(0, L"EDIT", L"", WS_CHILD | WS_VISIBLE |
                WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 100, 28, hwnd,
                reinterpret_cast<HMENU>(static_cast<INT_PTR>(EDIT_ID)), g_instance, nullptr);
-        g_list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE |
+        g_list = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE |
                WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
                0, 0, 100, 100, hwnd,
                reinterpret_cast<HMENU>(static_cast<INT_PTR>(LIST_ID)), g_instance, nullptr);
@@ -353,8 +481,11 @@ static LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         ListView_SetTextBkColor(g_list, g_theme.bg);
         ListView_SetTextColor(g_list, g_theme.fg);
         SetWindowTheme(g_list, darkColor(g_theme.bg) ? L"DarkMode_Explorer" : L"Explorer", nullptr);
-        HWND header = ListView_GetHeader(g_list);
-        if (header) SetWindowTheme(header, darkColor(g_theme.bg) ? L"DarkMode_ItemsView" : L"Explorer", nullptr);
+        g_header = ListView_GetHeader(g_list);
+        if (g_header) {
+            SetWindowTheme(g_header, darkColor(g_theme.bg) ? L"DarkMode_ItemsView" : L"Explorer", nullptr);
+            SetWindowSubclass(g_header, headerSubclass, 1, 0);
+        }
         LVCOLUMNW column{};
         column.mask = LVCF_TEXT | LVCF_WIDTH | LVCF_FMT;
         column.fmt = LVCFMT_LEFT;
@@ -379,8 +510,30 @@ static LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         return 0;
     }
     case WM_SIZE:
-        if (wp != SIZE_MINIMIZED) layoutChildren(hwnd);
+        if (wp != SIZE_MINIMIZED) { layoutChildren(hwnd); InvalidateRect(hwnd, nullptr, FALSE); }
         return 0;
+    case WM_PAINT: {
+        PAINTSTRUCT ps{};
+        HDC dc = BeginPaint(hwnd, &ps);
+        if (dc) {
+            HBRUSH border = CreateSolidBrush(frameColor());
+            if (g_edit && IsWindow(g_edit)) {
+                RECT rc{}; GetWindowRect(g_edit, &rc);
+                MapWindowPoints(HWND_DESKTOP, hwnd, reinterpret_cast<POINT*>(&rc), 2);
+                InflateRect(&rc, 1, 1);
+                FrameRect(dc, &rc, border);
+            }
+            if (g_list && IsWindow(g_list)) {
+                RECT rc{}; GetWindowRect(g_list, &rc);
+                MapWindowPoints(HWND_DESKTOP, hwnd, reinterpret_cast<POINT*>(&rc), 2);
+                InflateRect(&rc, 1, 1);
+                FrameRect(dc, &rc, border);
+            }
+            DeleteObject(border);
+        }
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
     case WM_GETMINMAXINFO: {
         auto* info = reinterpret_cast<MINMAXINFO*>(lp);
         info->ptMinTrackSize.x = MIN_WIDTH;
@@ -403,23 +556,16 @@ static LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         FillRect(reinterpret_cast<HDC>(wp), &r, g_backgroundBrush);
         return 1;
     }
-    case WM_NOTIFY:
-        if (reinterpret_cast<NMHDR*>(lp)->idFrom == LIST_ID) {
-            auto* note = reinterpret_cast<NMHDR*>(lp);
-            if (note->code == NM_CUSTOMDRAW) {
-                auto* draw = reinterpret_cast<NMLVCUSTOMDRAW*>(lp);
-                if (draw->nmcd.dwDrawStage == CDDS_PREPAINT) return CDRF_NOTIFYITEMDRAW;
-                if (draw->nmcd.dwDrawStage == CDDS_ITEMPREPAINT) {
-                    bool selected = (ListView_GetItemState(g_list, static_cast<int>(draw->nmcd.dwItemSpec), LVIS_SELECTED) & LVIS_SELECTED) != 0;
-                    draw->clrText = selected ? g_theme.selectionText : g_theme.fg;
-                    draw->clrTextBk = selected ? g_theme.selection : g_theme.bg;
-                    return CDRF_NEWFONT;
-                }
-            }
-            if (reinterpret_cast<NMHDR*>(lp)->code == NM_DBLCLK) { activateSelected(); return 0; }
-            if (reinterpret_cast<NMHDR*>(lp)->code == NM_CLICK) { SetFocus(g_edit); return 0; }
-        }
+    case WM_NOTIFY: {
+        auto* note = reinterpret_cast<NMHDR*>(lp);
+        if (g_header && note->hwndFrom == g_header && note->code == NM_CUSTOMDRAW)
+            return drawHeader(reinterpret_cast<NMCUSTOMDRAW*>(lp));
+        if (note->hwndFrom == g_list && note->code == NM_CUSTOMDRAW)
+            return drawListRow(reinterpret_cast<NMLVCUSTOMDRAW*>(lp));
+        if (note->hwndFrom == g_list && note->code == NM_DBLCLK) { activateSelected(); return 0; }
+        if (note->hwndFrom == g_list && note->code == NM_CLICK) { SetFocus(g_edit); return 0; }
         break;
+    }
     case WM_ACTIVATE:
         if (LOWORD(wp) == WA_INACTIVE && !g_closing) {
             // Mouse-click outside dismisses without stealing focus from another app.
@@ -435,7 +581,7 @@ static LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         saveSettings(hwnd);
         if (g_edit && g_oldEditProc && IsWindow(g_edit))
             SetWindowLongPtrW(g_edit, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_oldEditProc));
-        g_popup = g_edit = g_list = nullptr;
+        g_popup = g_edit = g_list = g_header = nullptr;
         g_oldEditProc = nullptr;
         if (g_font) { DeleteObject(g_font); g_font = nullptr; }
         g_documents.clear();
