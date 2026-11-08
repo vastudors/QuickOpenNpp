@@ -1,49 +1,27 @@
-# QuickOpenNpp v0.2
+# QuickOpenNpp v0.4 — Theme-consistent results and headers
 
-Native Windows Notepad++ plugin that switches among **already open** documents.
+This release updates v0.3. It preserves `Ctrl+Alt+Shift+S`, fuzzy filtering, keyboard navigation, resize/column-width persistence, and **Plugins → QuickOpenNpp → Configuration...**.
 
 ## What's new
 
-- Resizable popup, with saved location and size.
-- Two aligned, resizable columns: **File name** and **Folder**.
-- Saved column widths, maintained between Notepad++ sessions.
-- Correctly rendered Unicode text without a garbled dash separator.
-- Escape and close button return focus to Notepad++.
-- Clicking outside closes the popup without stealing focus from the app clicked.
-- The shortcut `Ctrl+Alt+Shift+S` is unchanged.
-- Fuzzy filtering and up/down + Enter navigation are unchanged.
+- Owner-drawn column header cells now use the chosen appearance palette.
+- The header area after the rightmost column is painted with the same palette.
+- Selected rows use custom background and foreground colors, including the unused area to the right of the columns.
+- Search and list controls have subtle borders derived from the palette instead of bright Windows 3D edges.
+- Header dividers remain draggable and saved column widths continue to work.
 
-Settings are stored in `QuickOpenNpp.ini` in the user plugin configuration directory, obtained from Notepad++ via `NPPM_GETPLUGINSCONFIGDIR`.
+## Limitations
 
-## Build online (GitHub Actions)
+The Win32 system title bar and native scrollbars are not fully custom-drawn. Theme changes are picked up when reopening the popup. This source has **not been built or tested on Windows** in this environment.
 
-Upload these source files to the **root** of your GitHub repository, keeping `.github/workflows/build.yml` nested as shown:
+## Update existing GitHub repository
 
-```
-CMakeLists.txt
-QuickOpenNpp.cpp
-README.md
-.github/workflows/build.yml
-```
+Replace the root `QuickOpenNpp.cpp` with the file in this archive, commit the change, and open **Actions → Build QuickOpenNpp**. Keep the existing `CMakeLists.txt` if it already links `user32`, `gdi32`, `comctl32`, `comdlg32`, and `uxtheme`.
 
-Each commit triggers a GitHub Actions workflow that builds x64 and Win32 artifacts. Select the DLL matching your Notepad++ architecture.
-
-## Build locally
-
-```bat
-cmake -S . -B build -G "Visual Studio 17 2022" -A x64
-cmake --build build --config Release
-```
+Or upload all extracted project files, preserving `.github/workflows/build.yml`.
 
 ## Install
 
-1. Close Notepad++ entirely.
-2. Replace the old `QuickOpenNpp.dll` in the *existing* plugin directory (`plugins\QuickOpenNpp\`).
-3. Restart Notepad++.
-4. Press `Ctrl+Alt+Shift+S`.
+After successful GitHub Actions build, download the artifact matching Notepad++'s architecture (Win32 or x64), close Notepad++, and replace `plugins\QuickOpenNpp\QuickOpenNpp.dll` in your Notepad++ installation. Restart Notepad++.
 
-The popup can be resized using its edges and corners. Drag a column header divider to resize columns. Each close saves sizes and position. Press Escape to dismiss and return focus to Notepad++.
-
-## Notes
-
-This version is a source-level update; it has not been compiled or runtime-tested on Windows in this environment. The GitHub Actions build is the intended verification step.
+If a build fails, capture the first compiler/linker error from the build job.
