@@ -1,4 +1,4 @@
-// QuickOpenNpp v0.5.0 — native Win32 open-document fuzzy switcher for Notepad++.
+// QuickOpenNpp v0.5.1 — native Win32 open-document fuzzy switcher for Notepad++.
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -192,9 +192,10 @@ static void loadSettings() {
     g_height = std::max(MIN_HEIGHT, readInt(L"Height", DEFAULT_HEIGHT));
     g_nameWidth = std::max(70, readInt(L"NameWidth", 230));
     g_folderWidth = std::max(70, readInt(L"FolderWidth", 440));
-    g_sortColumn = readInt(L"SortColumn", -1);
-    if (g_sortColumn < -1 || g_sortColumn > 1) g_sortColumn = -1;
-    g_sortAscending = readInt(L"SortAscending", 1) != 0;
+    // Every popup starts with the default (unsorted) document order.
+    // Legacy saved sort preferences are intentionally ignored.
+    g_sortColumn = -1;
+    g_sortAscending = true;
     const int missing = INT_MIN;
     g_x = readInt(L"X", missing);
     g_y = readInt(L"Y", missing);
@@ -212,8 +213,6 @@ static void saveSettings(HWND hwnd) {
     if (g_list && IsWindow(g_list)) {
         writeInt(L"NameWidth", ListView_GetColumnWidth(g_list, 0));
         writeInt(L"FolderWidth", ListView_GetColumnWidth(g_list, 1));
-        writeInt(L"SortColumn", g_sortColumn);
-        writeInt(L"SortAscending", g_sortAscending ? 1 : 0);
     }
 }
 
@@ -612,10 +611,16 @@ static LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
         if (note->hwndFrom == g_list && note->code == LVN_COLUMNCLICK) {
             const int col = reinterpret_cast<NMLISTVIEW*>(lp)->iSubItem;
             if (col == 0 || col == 1) {
-                if (g_sortColumn == col) g_sortAscending = !g_sortAscending;
-                else { g_sortColumn = col; g_sortAscending = true; }
-                writeInt(L"SortColumn", g_sortColumn);
-                writeInt(L"SortAscending", g_sortAscending ? 1 : 0);
+                // Cycle: ascending -> descending -> no sort (fuzzy relevance).
+                if (g_sortColumn != col) {
+                    g_sortColumn = col;
+                    g_sortAscending = true;
+                } else if (g_sortAscending) {
+                    g_sortAscending = false;
+                } else {
+                    g_sortColumn = -1;
+                    g_sortAscending = true;
+                }
                 updateMatches();
                 if (g_header) InvalidateRect(g_header, nullptr, TRUE);
                 if (g_edit) SetFocus(g_edit);
