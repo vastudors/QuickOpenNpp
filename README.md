@@ -1,61 +1,49 @@
-# QuickOpenNpp
+# QuickOpenNpp v0.2
 
-A lightweight, native Windows Notepad++ plugin. Press **Ctrl+Alt+Shift+S**, type a fuzzy filename query, select a result with Up/Down, and press Enter to switch tabs. Escape closes the popup.
+Native Windows Notepad++ plugin that switches among **already open** documents.
 
-## Build (Windows)
+## What's new
 
-Prerequisites: Visual Studio 2022 with **Desktop development with C++**, Windows SDK, CMake.
+- Resizable popup, with saved location and size.
+- Two aligned, resizable columns: **File name** and **Folder**.
+- Saved column widths, maintained between Notepad++ sessions.
+- Correctly rendered Unicode text without a garbled dash separator.
+- Escape and close button return focus to Notepad++.
+- Clicking outside closes the popup without stealing focus from the app clicked.
+- The shortcut `Ctrl+Alt+Shift+S` is unchanged.
+- Fuzzy filtering and up/down + Enter navigation are unchanged.
 
-Open a **x64 Native Tools Command Prompt for VS 2022** and run in this directory:
+Settings are stored in `QuickOpenNpp.ini` in the user plugin configuration directory, obtained from Notepad++ via `NPPM_GETPLUGINSCONFIGDIR`.
+
+## Build online (GitHub Actions)
+
+Upload these source files to the **root** of your GitHub repository, keeping `.github/workflows/build.yml` nested as shown:
+
+```
+CMakeLists.txt
+QuickOpenNpp.cpp
+README.md
+.github/workflows/build.yml
+```
+
+Each commit triggers a GitHub Actions workflow that builds x64 and Win32 artifacts. Select the DLL matching your Notepad++ architecture.
+
+## Build locally
 
 ```bat
 cmake -S . -B build -G "Visual Studio 17 2022" -A x64
 cmake --build build --config Release
 ```
 
-The result is `build\Release\QuickOpenNpp.dll`.
-
-For 32-bit Notepad++, use `-A Win32` instead of `-A x64` and make sure the plugin architecture matches Notepad++.
-
 ## Install
 
-1. Exit Notepad++.
-2. Find your Notepad++ installation's `plugins` directory, typically `C:\Program Files\Notepad++\plugins`.
-3. Create `plugins\QuickOpenNpp\` and copy `QuickOpenNpp.dll` into it. Final path: `plugins\QuickOpenNpp\QuickOpenNpp.dll`.
-4. Restart Notepad++.
-5. Use **Plugins > QuickOpenNpp > Quick Open Documents** or press **Ctrl+Alt+Shift+S**.
-6. If that shortcut is already assigned or overridden by your settings, configure **Settings > Shortcut Mapper > Plugin commands > Quick Open Documents**.
+1. Close Notepad++ entirely.
+2. Replace the old `QuickOpenNpp.dll` in the *existing* plugin directory (`plugins\QuickOpenNpp\`).
+3. Restart Notepad++.
+4. Press `Ctrl+Alt+Shift+S`.
 
-## Behavior
+The popup can be resized using its edges and corners. Drag a column header divider to resize columns. Each close saves sizes and position. Press Escape to dismiss and return focus to Notepad++.
 
-- Lists only already-open Notepad++ documents from both editor views.
-- Includes unnamed/unsaved tabs if Notepad++ provides a buffer path/name.
-- Deduplicates files cloned across editor views.
-- Fuzzy case-insensitive subsequence match on **filename**; exact substring matches rank higher.
-- Up/Down and Page Up/Page Down navigate; Enter switches; Escape cancels; double-click also switches.
-- Uses Windows-native UI, no external runtime or network requests.
+## Notes
 
-## Current limitations
-
-- Simple Windows-native appearance; does not yet highlight matched characters.
-- Uses tab order for equal-score matches; does not implement most-recently-used order.
-- Not built or executed in this Linux environment; the Windows build and runtime behavior need validation on your Notepad++ installation.
-- Popup width is fixed in physical pixels; DPI-aware scaling is a future enhancement.
-
-## Notepad++ API used
-
-`NPPM_GETNBOPENFILES`, `NPPM_GETBUFFERIDFROMPOS`, `NPPM_GETFULLPATHFROMBUFFERID`, and `NPPM_ACTIVATEDOC`.
-
-Documentation: https://npp-user-manual.org/docs/plugin-communication/
-
-Source license: MIT (local original code). This implementation uses the public plugin ABI declarations and does not embed third-party SDK files.
-
-## Build online without installing Visual Studio (GitHub Actions)
-
-1. Create a GitHub repository (it can be private).
-2. Upload **all files in this project**, including the hidden `.github/workflows/build.yml` file, to the repository root. An easy method is to unpack the ZIP locally, then use GitHub's **Add file > Upload files** on the extracted contents; verify that `.github/workflows/build.yml` is present afterward. If your upload doesn't preserve hidden directories, create that workflow file via GitHub's **Add file > Create new file** and paste its contents.
-3. Open your repository's **Actions** tab. Select **Build QuickOpenNpp** and **Run workflow**, or let the first push trigger it automatically.
-4. Open the completed workflow run and download the **QuickOpenNpp-x64** artifact under **Artifacts** (or **QuickOpenNpp-Win32** for a 32-bit Notepad++ installation).
-5. Extract the downloaded artifact ZIP and install the DLL as described above.
-
-GitHub Actions builds on GitHub-hosted Windows computers, so you don't need Windows or Visual Studio on your own machine. The builds have **not been tested** here and might uncover source issues; check the job logs if a build fails.
+This version is a source-level update; it has not been compiled or runtime-tested on Windows in this environment. The GitHub Actions build is the intended verification step.
