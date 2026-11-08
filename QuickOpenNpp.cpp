@@ -1,5 +1,10 @@
 // QuickOpenNpp - a tiny native Notepad++ open-document switcher.
 // Build using Windows SDK / MSVC; Notepad++ v8.x (Unicode plugin ABI).
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+
 #define UNICODE
 #define _UNICODE
 #define WIN32_LEAN_AND_MEAN
