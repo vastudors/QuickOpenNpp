@@ -1,4 +1,4 @@
-// QuickOpenNpp v0.4.1 — native Win32 open-document fuzzy switcher for Notepad++.
+// QuickOpenNpp v0.5.0 — native Win32 open-document fuzzy switcher for Notepad++.
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
@@ -57,6 +57,9 @@ static WNDPROC g_oldEditProc = nullptr;
 static HFONT g_font = nullptr;
 static std::vector<Document> g_documents;
 static std::vector<int> g_results;
+// -1 = default fuzzy relevance; 0 = File name; 1 = Folder.
+static int g_sortColumn = -1;
+static bool g_sortAscending = true;
 static std::wstring g_iniPath;
 static int g_width = DEFAULT_WIDTH, g_height = DEFAULT_HEIGHT;
 static int g_x = CW_USEDEFAULT, g_y = CW_USEDEFAULT;
@@ -189,6 +192,9 @@ static void loadSettings() {
     g_height = std::max(MIN_HEIGHT, readInt(L"Height", DEFAULT_HEIGHT));
     g_nameWidth = std::max(70, readInt(L"NameWidth", 230));
     g_folderWidth = std::max(70, readInt(L"FolderWidth", 440));
+    g_sortColumn = readInt(L"SortColumn", -1);
+    if (g_sortColumn < -1 || g_sortColumn > 1) g_sortColumn = -1;
+    g_sortAscending = readInt(L"SortAscending", 1) != 0;
     const int missing = INT_MIN;
     g_x = readInt(L"X", missing);
     g_y = readInt(L"Y", missing);
@@ -206,6 +212,8 @@ static void saveSettings(HWND hwnd) {
     if (g_list && IsWindow(g_list)) {
         writeInt(L"NameWidth", ListView_GetColumnWidth(g_list, 0));
         writeInt(L"FolderWidth", ListView_GetColumnWidth(g_list, 1));
+        writeInt(L"SortColumn", g_sortColumn);
+        writeInt(L"SortAscending", g_sortAscending ? 1 : 0);
     }
 }
 
@@ -245,8 +253,24 @@ static void updateMatches() {
         int score = fuzzyScore(g_documents[i].name, query);
         if (score >= 0) scores.emplace_back(i, score);
     }
+    // A column click overrides fuzzy relevance ORDER, but never filtering.
+    // CompareStringOrdinal gives Unicode case-insensitive ordering without a locale-dependent
+    // lexicographical comparison. Preserve the initial tab order for equal values.
     std::stable_sort(scores.begin(), scores.end(), [](const auto& a, const auto& b) {
-        return a.second > b.second;
+        if (g_sortColumn < 0) return a.second > b.second;
+        const Document& left = g_documents[a.first];
+        const Document& right = g_documents[b.first];
+        const std::wstring& lhs = g_sortColumn == 0 ? left.name : left.folder;
+        const std::wstring& rhs = g_sortColumn == 0 ? right.name : right.folder;
+        int cmp = CompareStringOrdinal(lhs.c_str(), -1, rhs.c_str(), -1, TRUE);
+        if (cmp != CSTR_EQUAL) {
+            return g_sortAscending ? cmp == CSTR_LESS_THAN : cmp == CSTR_GREATER_THAN;
+        }
+        // Tie-break by the other column, always ascending for a consistent order.
+        const std::wstring& otherL = g_sortColumn == 0 ? left.folder : left.name;
+        const std::wstring& otherR = g_sortColumn == 0 ? right.folder : right.name;
+        int other = CompareStringOrdinal(otherL.c_str(), -1, otherR.c_str(), -1, TRUE);
+        return other == CSTR_LESS_THAN;
     });
     g_results.clear();
     SendMessageW(g_list, WM_SETREDRAW, FALSE, 0);
@@ -403,9 +427,34 @@ static LRESULT drawHeader(NMCUSTOMDRAW* draw) {
         if (font) SelectObject(draw->hdc, font);
         RECT text = draw->rc;
         text.left += 7;
-        text.right -= 7;
+        text.right -= (column == g_sortColumn ? 24 : 7);
         DrawTextW(draw->hdc, name, -1, &text,
                   DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if (column == g_sortColumn) {
+            // Draw an up/down triangle using the palette, including in custom-color mode.
+            // A separate arrow is necessary because header item painting is custom drawn.
+            const int centerX = draw->rc.right - 13;
+            const int centerY = (draw->rc.top + draw->rc.bottom) / 2;
+            POINT triangle[3]{};
+            if (g_sortAscending) {
+                triangle[0] = {centerX, centerY - 4};
+                triangle[1] = {centerX - 5, centerY + 3};
+                triangle[2] = {centerX + 5, centerY + 3};
+            } else {
+                triangle[0] = {centerX - 5, centerY - 3};
+                triangle[1] = {centerX + 5, centerY - 3};
+                triangle[2] = {centerX, centerY + 4};
+            }
+            HBRUSH arrowBrush = CreateSolidBrush(g_theme.fg);
+            HPEN arrowPen = CreatePen(PS_SOLID, 1, g_theme.fg);
+            HGDIOBJ oldBrush = SelectObject(draw->hdc, arrowBrush);
+            HGDIOBJ oldArrowPen = SelectObject(draw->hdc, arrowPen);
+            Polygon(draw->hdc, triangle, 3);
+            SelectObject(draw->hdc, oldArrowPen);
+            SelectObject(draw->hdc, oldBrush);
+            DeleteObject(arrowPen);
+            DeleteObject(arrowBrush);
+        }
         RestoreDC(draw->hdc, saved);
     }
     return CDRF_SKIPDEFAULT;
@@ -472,7 +521,7 @@ static LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
                WS_TABSTOP | ES_AUTOHSCROLL, 0, 0, 100, 28, hwnd,
                reinterpret_cast<HMENU>(static_cast<INT_PTR>(EDIT_ID)), g_instance, nullptr);
         g_list = CreateWindowExW(0, WC_LISTVIEWW, L"", WS_CHILD | WS_VISIBLE |
-               WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER,
+               WS_TABSTOP | LVS_REPORT | LVS_SINGLESEL | LVS_SHOWSELALWAYS,
                0, 0, 100, 100, hwnd,
                reinterpret_cast<HMENU>(static_cast<INT_PTR>(LIST_ID)), g_instance, nullptr);
         if (!g_edit || !g_list) return -1;
@@ -558,6 +607,21 @@ static LRESULT CALLBACK popupProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
     }
     case WM_NOTIFY: {
         auto* note = reinterpret_cast<NMHDR*>(lp);
+        // The ListView sends LVN_COLUMNCLICK when the user clicks a report header.
+        // Do not hook a header mouse message: that would interfere with dragging dividers.
+        if (note->hwndFrom == g_list && note->code == LVN_COLUMNCLICK) {
+            const int col = reinterpret_cast<NMLISTVIEW*>(lp)->iSubItem;
+            if (col == 0 || col == 1) {
+                if (g_sortColumn == col) g_sortAscending = !g_sortAscending;
+                else { g_sortColumn = col; g_sortAscending = true; }
+                writeInt(L"SortColumn", g_sortColumn);
+                writeInt(L"SortAscending", g_sortAscending ? 1 : 0);
+                updateMatches();
+                if (g_header) InvalidateRect(g_header, nullptr, TRUE);
+                if (g_edit) SetFocus(g_edit);
+            }
+            return 0;
+        }
         if (g_header && note->hwndFrom == g_header && note->code == NM_CUSTOMDRAW)
             return drawHeader(reinterpret_cast<NMCUSTOMDRAW*>(lp));
         if (note->hwndFrom == g_list && note->code == NM_CUSTOMDRAW)
